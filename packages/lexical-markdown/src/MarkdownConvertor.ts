@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  *
  */
+import {$isAutoLinkNode, $isLinkNode, LinkNode} from '@lexical/link';
 import {$isHeadingNode, HeadingNode} from '@lexical/rich-text';
 import {
   $isBlockElementNode,
@@ -177,48 +178,134 @@ export class MarkdownConvertorState {
     this._inlineBuffer.push(inlineText);
   }
 
-  flushInline(): void {
+  getInlineText(): string {
     const inlineBuffer = this._inlineBuffer;
-
-    let result = '';
-    let prevFormats: InlineFormat[] = [];
-
-    const openTags = (formats: InlineFormat[]) =>
-      formats.map((f) => f.openTag).join('');
-    const closeTags = (formats: InlineFormat[]) =>
-      formats
-        .slice()
-        .reverse()
-        .map((f) => f.closeTag)
-        .join('');
-
-    for (let i = 0; i < inlineBuffer.length; i++) {
-      const {text, formats} = inlineBuffer[i];
-
-      let common = 0;
-      while (
-        common < prevFormats.length &&
-        common < formats.length &&
-        prevFormats[common].type === formats[common].type &&
-        prevFormats[common].htmlInline === formats[common].htmlInline
-      ) {
-        common++;
-      }
-
-      const toClose = prevFormats.slice(common);
-      result += closeTags(toClose);
-
-      const toOpen = formats.slice(common);
-      result += openTags(toOpen);
-
-      result += text;
-      prevFormats = formats;
+    if (inlineBuffer.length === 0) {
+      return '';
     }
 
-    result += closeTags(prevFormats);
+    const isSameFormat =
+      (format: InlineFormat) =>
+      ({type, openTag, htmlInline}: InlineFormat): boolean => {
+        return (
+          type === format.type &&
+          openTag === format.openTag &&
+          htmlInline === format.htmlInline
+        );
+      };
 
+    const hasFormat = (
+      inlineText: InlineText | undefined,
+      format: InlineFormat,
+    ): boolean => {
+      if (!inlineText) {
+        return false;
+      }
+
+      return inlineText.formats.some(isSameFormat(format));
+    };
+
+    const process = (
+      inlineText: InlineText,
+      index: number,
+      unclosedTags: InlineFormat[],
+      unclosableTags: InlineFormat[],
+    ) => {
+      let output = inlineText.text;
+
+      // the opening tags to be added to the result
+      let openingTags = '';
+      // the closing tags to be added to the result
+      let closingTagsBefore = '';
+      let closingTagsAfter = '';
+
+      const prevInlineText = inlineBuffer[index - 1];
+      const nextInlineText = inlineBuffer[index + 1];
+
+      const applied = new Set();
+
+      for (const format of inlineText.formats) {
+        // dedup applied formats
+        if (hasFormat(inlineText, format) && !applied.has(format)) {
+          // Multiple tags might be used for the same format (*, _)
+          applied.add(format);
+
+          // append the tag to openingTags, if it's not applied to the previous nodes,
+          // or the nodes before that (which would result in an unclosed tag)
+          if (
+            !hasFormat(prevInlineText, format) ||
+            !unclosedTags.find(isSameFormat(format))
+          ) {
+            unclosedTags.push(format);
+            openingTags += format.openTag;
+          }
+        }
+      }
+
+      // close any tags in the same order they were applied, if necessary
+      for (let i = 0; i < unclosedTags.length; i++) {
+        const nodeHasFormat = hasFormat(inlineText, unclosedTags[i]);
+        const nextNodeHasFormat = hasFormat(nextInlineText, unclosedTags[i]);
+
+        // prevent adding closing tag if next sibling will do it
+        if (nodeHasFormat && nextNodeHasFormat) {
+          continue;
+        }
+
+        const unhandledUnclosedTags = [...unclosedTags]; // Shallow copy to avoid modifying the original array
+
+        while (unhandledUnclosedTags.length > i) {
+          const unclosedTag = unhandledUnclosedTags.pop();
+
+          // If tag is unclosable, don't close it and leave it in the original array,
+          // So that it can be closed when it's no longer unclosable
+          if (
+            unclosableTags &&
+            unclosedTag &&
+            unclosableTags.find(isSameFormat(unclosedTag))
+          ) {
+            continue;
+          }
+
+          if (unclosedTag) {
+            if (!nodeHasFormat) {
+              // Handles cases where the tag has not been closed before, e.g. if the previous node
+              // was a text match transformer that did not account for closing tags of the next node (e.g. a link)
+              closingTagsBefore += unclosedTag.closeTag;
+            } else if (!nextNodeHasFormat) {
+              closingTagsAfter += unclosedTag.closeTag;
+            }
+          }
+          // Mutate the original array to remove the closed tag
+          unclosedTags.pop();
+        }
+        break;
+      }
+
+      output = openingTags + output + closingTagsAfter;
+      // Replace trimmed version of textContent ensuring surrounding whitespace is not modified
+      return closingTagsBefore + output;
+    };
+
+    const unclosedTags: InlineFormat[] = [];
+    const unclosableTags: InlineFormat[] = [];
+
+    const result = inlineBuffer
+      .map((inlineText, index) =>
+        process(inlineText, index, unclosedTags, unclosableTags),
+      )
+      .join('');
+
+    return result;
+  }
+
+  flushInlineText(): void {
+    const result = this.getInlineText();
     this.write(result);
+    this.closeInlineText();
+  }
 
+  closeInlineText(): void {
     this._inlineBuffer = [];
   }
 
@@ -279,6 +366,8 @@ export class MarkdownConvertorState {
   }
 
   convertInline(parent: LexicalNode): void {
+    this.flushInlineText();
+
     if ($isElementNode(parent)) {
       parent.getChildren().forEach((node) => {
         this.convertBlock(node);
@@ -287,7 +376,7 @@ export class MarkdownConvertorState {
       // ??
       this.convertBlock(parent);
     }
-    this.flushInline();
+    this.flushInlineText();
   }
 
   convertNode(parent: ElementNode): void {
@@ -359,14 +448,6 @@ const defaultMarkdownConversionMap: MarkdownConversionMap = {
         });
       }
 
-      if (node.hasFormat('strikethrough')) {
-        formats.push({
-          closeTag: '~~',
-          openTag: '~~',
-          type: 'strikethrough',
-        });
-      }
-
       if (node.hasFormat('italic')) {
         formats.push({
           closeTag: '*',
@@ -375,11 +456,11 @@ const defaultMarkdownConversionMap: MarkdownConversionMap = {
         });
       }
 
-      if (node.hasFormat('code')) {
+      if (node.hasFormat('strikethrough')) {
         formats.push({
-          closeTag: '`',
-          openTag: '`',
-          type: 'code',
+          closeTag: '~~',
+          openTag: '~~',
+          type: 'strikethrough',
         });
       }
 
@@ -419,6 +500,14 @@ const defaultMarkdownConversionMap: MarkdownConversionMap = {
         });
       }
 
+      if (node.hasFormat('code')) {
+        formats.push({
+          closeTag: '`',
+          openTag: '`',
+          type: 'code',
+        });
+      }
+
       // escape
       state.writeInline({
         formats,
@@ -433,6 +522,7 @@ const defaultMarkdownConversionMap: MarkdownConversionMap = {
         return;
       }
 
+      state.flushInlineText();
       state.ensureNewLine();
     },
     priority: 0,
@@ -470,9 +560,35 @@ const defaultMarkdownConversionMap: MarkdownConversionMap = {
     },
     priority: 0,
   }),
-};
 
-export const headingMarkdownConversionMap: MarkdownConversionMap = {
+  [LinkNode.getType()]: () => ({
+    conversion: (node: LexicalNode, state: MarkdownConvertorState) => {
+      if (!$isLinkNode(node)) {
+        return;
+      }
+
+      if ($isAutoLinkNode(node) && node.getIsUnlinked()) {
+        node.getChildren().forEach((child) => {
+          state.convertBlock(child);
+        });
+        return;
+      }
+
+      state.flushInlineText();
+      node.getChildren().forEach((child) => {
+        state.convertBlock(child);
+      });
+
+      const text = state.getInlineText();
+      state.closeInlineText();
+
+      const title = node.getTitle();
+      const url = node.getURL();
+
+      state.write(title ? `[${text}](${url} "${title}")` : `[${text}](${url})`);
+    },
+    priority: 0,
+  }),
   [HeadingNode.getType()]: () => ({
     conversion: (node: LexicalNode, state: MarkdownConvertorState) => {
       if (!$isHeadingNode(node)) {
