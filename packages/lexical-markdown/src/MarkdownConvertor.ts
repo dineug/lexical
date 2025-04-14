@@ -5,12 +5,25 @@
  * LICENSE file in the root directory of this source tree.
  *
  */
+import {$isCodeNode, CodeNode} from '@lexical/code';
 import {$isAutoLinkNode, $isLinkNode, LinkNode} from '@lexical/link';
-import {$isHeadingNode, HeadingNode} from '@lexical/rich-text';
+import {
+  $isListItemNode,
+  $isListNode,
+  ListItemNode,
+  ListNode,
+} from '@lexical/list';
+import {
+  $isHeadingNode,
+  $isQuoteNode,
+  HeadingNode,
+  QuoteNode,
+} from '@lexical/rich-text';
 import {
   $isBlockElementNode,
   $isDecoratorNode,
   $isElementNode,
+  $isInlineElementOrDecoratorNode,
   $isLineBreakNode,
   $isParagraphNode,
   $isTabNode,
@@ -125,28 +138,26 @@ export class MarkdownConvertorState {
    * flushClose(3) - "\n" + "delim\n" + "delim\n"
    */
   flushClose(size: number = 2): void {
-    if (this._stopNewline || !this._closed) {
-      return;
-    }
-
-    if (!this.isInBlank()) {
-      this.addOutput('\n');
-    }
-
-    if (size > 1) {
-      let delimMin = this._delim;
-      const trim = /\s+$/.exec(delimMin);
-
-      if (trim) {
-        delimMin = delimMin.slice(0, delimMin.length - trim[0].length);
+    if (!this._stopNewline && this._closed) {
+      if (!this.isInBlank()) {
+        this.addOutput('\n');
       }
 
-      for (let i = 1; i < size; i += 1) {
-        this.addOutput(`${delimMin}\n`);
-      }
-    }
+      if (size > 1) {
+        let delimMin = this._delim;
+        const trim = /\s+$/.exec(delimMin);
 
-    this._closed = false;
+        if (trim) {
+          delimMin = delimMin.slice(0, delimMin.length - trim[0].length);
+        }
+
+        for (let i = 1; i < size; i += 1) {
+          this.addOutput(`${delimMin}\n`);
+        }
+      }
+
+      this._closed = false;
+    }
   }
 
   write(content = ''): void {
@@ -174,7 +185,7 @@ export class MarkdownConvertorState {
     }
   }
 
-  writeInline(inlineText: InlineText): void {
+  writeInlineText(inlineText: InlineText): void {
     this._inlineBuffer.push(inlineText);
   }
 
@@ -360,8 +371,6 @@ export class MarkdownConvertorState {
 
     if (conversion) {
       conversion.conversion(node, this);
-    } else {
-      // TODO: $generateHtmlFromNodes
     }
   }
 
@@ -370,13 +379,20 @@ export class MarkdownConvertorState {
 
     if ($isElementNode(parent)) {
       parent.getChildren().forEach((node) => {
-        this.convertBlock(node);
+        if (
+          $isInlineElementOrDecoratorNode(node) ||
+          $isTextNode(node) ||
+          $isLineBreakNode(node)
+        ) {
+          this.convertBlock(node);
+        } else {
+          this.flushInlineText();
+          this.ensureNewLine();
+          this.convertBlock(node);
+        }
       });
-    } else {
-      // ??
-      this.convertBlock(parent);
+      this.flushInlineText();
     }
-    this.flushInlineText();
   }
 
   convertNode(parent: ElementNode): void {
@@ -386,16 +402,15 @@ export class MarkdownConvertorState {
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function convertList(
   state: MarkdownConvertorState,
-  node: ElementNode,
+  node: ListNode,
   delim: string,
   firstDelimFn: (index: number) => string,
 ) {
   const closed = state.getClosed();
 
-  if (closed && closed.getType() === node.getType()) {
+  if (closed && $isListNode(closed)) {
     state.flushClose(3);
   } else {
     state.flushClose(1);
@@ -404,6 +419,17 @@ function convertList(
   node.getChildren().forEach((child, index) => {
     if (index) {
       state.flushClose(1);
+    }
+
+    if ($isListItemNode(child)) {
+      const firstChildNode = child.getFirstChild();
+
+      if ($isListNode(firstChildNode)) {
+        state.wrapBlock(delim, null, node, () => {
+          state.convertBlock(firstChildNode);
+        });
+        return;
+      }
     }
 
     state.wrapBlock(delim, firstDelimFn(index), node, () => {
@@ -431,6 +457,80 @@ function convertTableCell(state: MarkdownConvertorState, node: ElementNode) {
   state.setStopNewline(false);
 }
 
+function getInlineFormats(node: TextNode): InlineFormat[] {
+  const formats: InlineFormat[] = [];
+
+  if (node.hasFormat('bold')) {
+    formats.push({
+      closeTag: '**',
+      openTag: '**',
+      type: 'bold',
+    });
+  }
+
+  if (node.hasFormat('italic')) {
+    formats.push({
+      closeTag: '*',
+      openTag: '*',
+      type: 'italic',
+    });
+  }
+
+  if (node.hasFormat('strikethrough')) {
+    formats.push({
+      closeTag: '~~',
+      openTag: '~~',
+      type: 'strikethrough',
+    });
+  }
+
+  if (node.hasFormat('highlight')) {
+    formats.push({
+      closeTag: '</mark>',
+      htmlInline: true,
+      openTag: '<mark>',
+      type: 'highlight',
+    });
+  }
+
+  if (node.hasFormat('underline')) {
+    formats.push({
+      closeTag: '</u>',
+      htmlInline: true,
+      openTag: '<u>',
+      type: 'underline',
+    });
+  }
+
+  if (node.hasFormat('subscript')) {
+    formats.push({
+      closeTag: '</sub>',
+      htmlInline: true,
+      openTag: '<sub>',
+      type: 'subscript',
+    });
+  }
+
+  if (node.hasFormat('superscript')) {
+    formats.push({
+      closeTag: '</sup>',
+      htmlInline: true,
+      openTag: '<sup>',
+      type: 'superscript',
+    });
+  }
+
+  if (node.hasFormat('code')) {
+    formats.push({
+      closeTag: '`',
+      openTag: '`',
+      type: 'code',
+    });
+  }
+
+  return formats;
+}
+
 const defaultMarkdownConversionMap: MarkdownConversionMap = {
   [TextNode.getType()]: () => ({
     conversion: (node: LexicalNode, state: MarkdownConvertorState) => {
@@ -438,79 +538,9 @@ const defaultMarkdownConversionMap: MarkdownConversionMap = {
         return;
       }
 
-      const formats: InlineFormat[] = [];
-
-      if (node.hasFormat('bold')) {
-        formats.push({
-          closeTag: '**',
-          openTag: '**',
-          type: 'bold',
-        });
-      }
-
-      if (node.hasFormat('italic')) {
-        formats.push({
-          closeTag: '*',
-          openTag: '*',
-          type: 'italic',
-        });
-      }
-
-      if (node.hasFormat('strikethrough')) {
-        formats.push({
-          closeTag: '~~',
-          openTag: '~~',
-          type: 'strikethrough',
-        });
-      }
-
-      if (node.hasFormat('highlight')) {
-        formats.push({
-          closeTag: '</mark>',
-          htmlInline: true,
-          openTag: '<mark>',
-          type: 'highlight',
-        });
-      }
-
-      if (node.hasFormat('underline')) {
-        formats.push({
-          closeTag: '</u>',
-          htmlInline: true,
-          openTag: '<u>',
-          type: 'underline',
-        });
-      }
-
-      if (node.hasFormat('subscript')) {
-        formats.push({
-          closeTag: '</sub>',
-          htmlInline: true,
-          openTag: '<sub>',
-          type: 'subscript',
-        });
-      }
-
-      if (node.hasFormat('superscript')) {
-        formats.push({
-          closeTag: '</sup>',
-          htmlInline: true,
-          openTag: '<sup>',
-          type: 'superscript',
-        });
-      }
-
-      if (node.hasFormat('code')) {
-        formats.push({
-          closeTag: '`',
-          openTag: '`',
-          type: 'code',
-        });
-      }
-
       // escape
-      state.writeInline({
-        formats,
+      state.writeInlineText({
+        formats: getInlineFormats(node),
         text: node.getTextContent(),
       });
     },
@@ -533,8 +563,15 @@ const defaultMarkdownConversionMap: MarkdownConversionMap = {
     }
 
     return {
-      conversion: (__node: LexicalNode, state: MarkdownConvertorState) => {
-        state.write(' '.repeat(4));
+      conversion: (tabNode: LexicalNode, state: MarkdownConvertorState) => {
+        if (!$isTabNode(tabNode)) {
+          return;
+        }
+
+        state.writeInlineText({
+          formats: getInlineFormats(tabNode),
+          text: ' '.repeat(4),
+        });
       },
       priority: 0,
     };
@@ -598,6 +635,80 @@ const defaultMarkdownConversionMap: MarkdownConversionMap = {
       const delim = '#'.repeat(Number(node.getTag().substring(1)));
       state.write(`${delim} `);
       state.convertInline(node);
+      state.closeBlock(node);
+    },
+    priority: 0,
+  }),
+  [QuoteNode.getType()]: () => ({
+    conversion: (node: LexicalNode, state: MarkdownConvertorState) => {
+      if (!$isQuoteNode(node)) {
+        return;
+      }
+
+      if ($isQuoteNode(node.getParent())) {
+        state.flushClose(1);
+      }
+
+      state.wrapBlock('> ', null, node, () => state.convertNode(node));
+    },
+    priority: 0,
+  }),
+  [ListNode.getType()]: () => ({
+    conversion: (node: LexicalNode, state: MarkdownConvertorState) => {
+      if (!$isListNode(node)) {
+        return;
+      }
+
+      const listType = node.getListType();
+
+      if (listType === 'number') {
+        const start = node.getStart();
+
+        convertList(state, node, ' '.repeat(4), (index: number) => {
+          const orderedNum = String(start + index);
+          return `${orderedNum}. `;
+        });
+      } else {
+        convertList(state, node, ' '.repeat(4), () => '- ');
+      }
+    },
+    priority: 0,
+  }),
+  [ListItemNode.getType()]: () => ({
+    conversion: (node: LexicalNode, state: MarkdownConvertorState) => {
+      if (!$isListItemNode(node)) {
+        return;
+      }
+
+      let isTask = false;
+      const parentNode = node.getParent();
+      if ($isListNode(parentNode)) {
+        isTask = parentNode.getListType() === 'check';
+      }
+
+      if (isTask) {
+        const checked = node.getChecked();
+        state.write(`[${checked ? 'x' : ' '}] `);
+      }
+
+      state.convertInline(node);
+    },
+    priority: 0,
+  }),
+  [CodeNode.getType()]: () => ({
+    conversion: (node: LexicalNode, state: MarkdownConvertorState) => {
+      if (!$isCodeNode(node)) {
+        return;
+      }
+
+      const delim = '```';
+      const textContent = node.getTextContent();
+      const language = node.getLanguage() || '';
+      state.write(`${delim}${language}`);
+      state.ensureNewLine();
+      state.text(textContent);
+      state.ensureNewLine();
+      state.write(delim);
       state.closeBlock(node);
     },
     priority: 0,
